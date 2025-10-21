@@ -44,7 +44,7 @@ result:
 no build needed. any POSIX shell should work.
 
 ```bash
-curl -fsSL -o snapper.sh <your-source-url>
+curl -fsSL -o snapper.sh https://raw.githubusercontent.com/code-n-go/snapper/main/snapper.sh
 chmod +x snapper.sh
 # optional: install to PATH
 install -m 0755 snapper.sh /usr/local/bin/snapper

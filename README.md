@@ -310,7 +310,7 @@ during `build`, snapper looks for simple blocks of a path on one line followed b
 
 ## license
 
-to be determined
+[MIT License](./LICENSE)
 
 ---
 

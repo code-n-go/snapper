@@ -50,8 +50,6 @@ chmod +x snapper.sh
 install -m 0755 snapper.sh /usr/local/bin/snapper
 ```
 
-> **note**: if you rename to `snapper`, update examples accordingly; the script accepts both `snapper.sh` and `snapper`.
-
 ---
 
 ## usage

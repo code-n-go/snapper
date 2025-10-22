@@ -1,11 +1,11 @@
 #!/usr/bin/env sh
 # snapper.sh — take a text-only snapshot of repo files (paths + contents) and rebuild them later
 # mascot: 🐢 (a careful little turtle taking snapshots)
-# version: 0.0.6
+# version: 0.0.9
 
 set -eu
 
-VERSION="0.0.6"
+VERSION="0.0.9"
 
 # defaults for 'snap'
 SNAP_MAX_KB=200
@@ -17,6 +17,8 @@ SNAP_PROJECT_ROOT="."   # configurable via -C
 SNAP_SPLIT_COUNT=0      # configurable via -s
 SNAP_TREE_ONLY=0        # configurable via -t
 SNAP_EXCLUDE_PATTERNS="" # configurable via -e
+SNAP_REMOVE_COMMENTS=0  # configurable via -r
+SNAP_REMOVE_BLANKS=0    # configurable via -w
 
 # defaults for 'build'
 BUILD_INPUT=""
@@ -54,6 +56,14 @@ OPTIONS: snap
   -m <kb>     Max size per file, in KB (default 200; 0 = no limit).
   -s <num>    Split the output into multiple files, each containing <num> files.
   -t          Tree-only mode: output only the paths of matched files, without content.
+  -r          Remove comments from files before snapshotting:
+              • // line comments (C-style)
+              • /* */ block comments (C-style, including multi-line)
+              • # line comments (shell/Python-style)
+              Note: # removal is skipped for .md, .txt, .rst, .doc, .docx, .rtf, .pdf,
+              .org, .adoc, and .asciidoc files to preserve document structure.
+  -w          Remove all blank lines and trailing whitespace from files.
+              Can be combined with -r for maximum token reduction.
   -e <pat>    Exclude pattern (can be used multiple times). Files matching any exclude
               pattern will be skipped even if they match an include pattern.
   -a          Include all dirs (disable default ignores like .git, node_modules, vendor, dist...).
@@ -74,10 +84,18 @@ BEHAVIOR:
   • Only text files are included; binaries are always skipped (no option to include).
   • 'snap' prefers `git ls-files -co --exclude-standard` (honors .gitignore); else falls back to `find`.
   • Metrics print to stdout (not embedded in the snapshot).
+  • Comment removal (-r) strips //, /* */, and # comments. Document formats (.md, .txt, etc.)
+    are exempt from # removal to preserve structure (e.g., Markdown headers).
 
 EXAMPLES:
   # Create a single, condensed snapshot of Go and Markdown files
   snapper.sh snap -f -o snapshot.txt '*.go' '**/*.md'
+
+  # Remove comments to reduce token usage
+  snapper.sh snap -r -o snapshot.txt '*.go' '*.js' '*.py'
+
+  # Remove comments and all blank lines for maximum compactness
+  snapper.sh snap -r -w -o snapshot.txt '*.go' '*.js' '*.py'
 
   # Exclude test files when snapshotting Go files
   snapper.sh snap -o snapshot.txt -e '*_test.go' '*.go'
@@ -112,6 +130,111 @@ is_text_file() {
     # if 'file' is unavailable, assume text
     return 0
   fi
+}
+
+# strip comments from a file
+# handles: // line comments, /* */ block comments (including multi-line), and # line comments
+# _strip_hash parameter: 0=skip # removal (for .md, .txt, etc.), 1=remove # comments
+strip_comments() {
+  _infile=$1
+  _outfile=$2
+  _strip_hash=$3
+
+  _in_block=0
+  _line_num=0
+
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    _line_num=$((_line_num + 1))
+    _output=""
+    _i=1
+    _len=${#_line}
+
+    # Check if original line is blank or whitespace-only
+    _original_trimmed=$(printf '%s' "$_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    _originally_blank=0
+    if [ -z "$_original_trimmed" ]; then
+      _originally_blank=1
+    fi
+
+    # Process character by character
+    while [ $_i -le $_len ]; do
+      _char=$(printf '%s' "$_line" | cut -c $_i)
+      _next_char=""
+      if [ $_i -lt $_len ]; then
+        _next_char=$(printf '%s' "$_line" | cut -c $((_i + 1)))
+      fi
+
+      # If we're in a block comment, look for */
+      if [ $_in_block -eq 1 ]; then
+        if [ "$_char" = "*" ] && [ "$_next_char" = "/" ]; then
+          _in_block=0
+          _i=$((_i + 2))
+          continue
+        fi
+        _i=$((_i + 1))
+        continue
+      fi
+
+      # Check for start of block comment /*
+      if [ "$_char" = "/" ] && [ "$_next_char" = "*" ]; then
+        _in_block=1
+        _i=$((_i + 2))
+        continue
+      fi
+
+      # Check for line comment //
+      if [ "$_char" = "/" ] && [ "$_next_char" = "/" ]; then
+        # Rest of line is a comment, break from character loop
+        break
+      fi
+
+      # Check for # line comment (if enabled for this file type)
+      if [ "$_strip_hash" -eq 1 ] && [ "$_char" = "#" ]; then
+        # Rest of line is a comment, break from character loop
+        break
+      fi
+
+      # Regular character, add to output
+      _output="${_output}${_char}"
+      _i=$((_i + 1))
+    done
+
+    # Decide whether to write the line:
+    # 1. If originally blank/whitespace-only, preserve it as blank
+    # 2. Otherwise, check if we extracted any code after comment removal
+    #    - If yes, write it (after trimming trailing whitespace)
+    #    - If no, skip the line (it was comment-only)
+
+    if [ $_originally_blank -eq 1 ]; then
+      # Original line was blank or whitespace-only, preserve it
+      printf '\n' >> "$_outfile"
+    else
+      # Original line had content, check what remains after comment removal
+      _trimmed=$(printf '%s' "$_output" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      if [ -n "$_trimmed" ]; then
+        # Line has code, write it (with trailing whitespace removed)
+        _output=$(printf '%s' "$_output" | sed 's/[[:space:]]*$//')
+        printf '%s\n' "$_output" >> "$_outfile"
+      fi
+      # Otherwise skip the line (it was comment-only)
+    fi
+  done < "$_infile"
+}
+
+# remove blank lines and trailing whitespace from a file
+remove_blank_lines() {
+  _infile=$1
+  _outfile=$2
+
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    # Remove trailing whitespace
+    _line=$(printf '%s' "$_line" | sed 's/[[:space:]]*$//')
+
+    # Only write non-empty lines
+    if [ -n "$_line" ]; then
+      printf '%s\n' "$_line" >> "$_outfile"
+    fi
+  done < "$_infile"
 }
 
 ################################################################################
@@ -155,25 +278,54 @@ snap_lang_fence() {
     md)   printf '%s' markdown ;;
     sh|zsh|bash) printf '%s' bash ;;
     py)   printf '%s' python ;;
+    rb)   printf '%s' ruby ;;
     rs)   printf '%s' rust ;;
-    cpp|cc|cxx|hpp|h) printf '%s' cpp ;;
+    c|h)  printf '%s' c ;;
+    cpp|cc|cxx|hpp) printf '%s' cpp ;;
+    java) printf '%s' java ;;
+    kt|kts) printf '%s' kotlin ;;
+    swift) printf '%s' swift ;;
+    cs)   printf '%s' csharp ;;
+    html) printf '%s' html ;;
+    css)  printf '%s' css ;;
+    scss|sass) printf '%s' scss ;;
+    xml)  printf '%s' xml ;;
+    sql)  printf '%s' sql ;;
+    lua)  printf '%s' lua ;;
+    vim)  printf '%s' vim ;;
+    m)    printf '%s' objectivec ;;
+    dart) printf '%s' dart ;;
+    scala) printf '%s' scala ;;
+    pl|pm) printf '%s' perl ;;
+    r)    printf '%s' r ;;
+    ex|exs) printf '%s' elixir ;;
+    erl|hrl) printf '%s' erlang ;;
+    clj|cljs|cljc) printf '%s' clojure ;;
+    lisp|el) printf '%s' lisp ;;
+    hs|lhs) printf '%s' haskell ;;
+    ml|mli) printf '%s' ocaml ;;
+    fs|fsi|fsx) printf '%s' fsharp ;;
+    nim)  printf '%s' nim ;;
+    v)    printf '%s' v ;;
+    zig)  printf '%s' zig ;;
     *)    printf '%s' '' ;;
   esac
 }
 
 run_snap() {
-  while getopts "o:C:m:s:e:taqfh" opt; do
+  while getopts "o:C:m:s:te:aqfrwh" opt; do
     case "$opt" in
       o) SNAP_OUTPUT="$OPTARG" ;;
       C) SNAP_PROJECT_ROOT="$OPTARG" ;;
       m) SNAP_MAX_KB="$OPTARG" ;;
       s) SNAP_SPLIT_COUNT="$OPTARG" ;;
-      e) SNAP_EXCLUDE_PATTERNS="${SNAP_EXCLUDE_PATTERNS}${OPTARG}
-" ;;
       t) SNAP_TREE_ONLY=1 ;;
+      e) SNAP_EXCLUDE_PATTERNS="${SNAP_EXCLUDE_PATTERNS}${OPTARG}"$'\n' ;;
       a) SNAP_USE_DEFAULT_IGNORES=0 ;;
       q) SNAP_QUIET=1 ;;
       f) SNAP_FORCE_OVERWRITE=1 ;;
+      r) SNAP_REMOVE_COMMENTS=1 ;;
+      w) SNAP_REMOVE_BLANKS=1 ;;
       h) print_help; exit 0 ;;
       \?) die "unknown flag -$OPTARG (use -h)" ;;
       :)  die "flag -$OPTARG requires an argument" ;;
@@ -181,29 +333,29 @@ run_snap() {
   done
   shift $((OPTIND-1))
 
-  [ -n "$SNAP_OUTPUT" ] || die "output path is required (-o <path>)"
-  [ "$#" -gt 0 ] || die "no patterns supplied"
+  [ -n "$SNAP_OUTPUT" ] || die "output snapshot is required (-o <path>)"
+  [ $# -gt 0 ] || die "at least one pattern is required (e.g., '*.go')"
 
-  START_DIR="$(pwd -P)"
-  case "$SNAP_OUTPUT" in
-    /*) SNAP_OUTPUT_BASE="$SNAP_OUTPUT" ;;
-    *)  SNAP_OUTPUT_BASE="$START_DIR/$SNAP_OUTPUT" ;;
-  esac
-
-  cd "$SNAP_PROJECT_ROOT" 2>/dev/null || die "cannot cd to project root: $SNAP_PROJECT_ROOT"
+  cd "$SNAP_PROJECT_ROOT" 2>/dev/null || die "cannot cd to $SNAP_PROJECT_ROOT"
   SNAP_PROJECT_ROOT_ABS="$(pwd -P)"
 
-  if [ -e "$SNAP_OUTPUT_BASE" ] && [ "$SNAP_FORCE_OVERWRITE" -ne 1 ]; then
-    printf '%s\n' "warning: output already exists: $SNAP_OUTPUT_BASE"
-    printf '%s\n' "         use -f to overwrite"
-    exit 3
+  # Resolve output path to absolute before changing dirs
+  case "$SNAP_OUTPUT" in
+    /*) SNAP_OUTPUT_BASE="$SNAP_OUTPUT" ;;
+    *)  SNAP_OUTPUT_BASE="$SNAP_PROJECT_ROOT_ABS/$SNAP_OUTPUT" ;;
+  esac
+
+  if [ "$SNAP_FORCE_OVERWRITE" -ne 1 ] && [ -e "$SNAP_OUTPUT_BASE" ]; then
+    die "output snapshot already exists: $SNAP_OUTPUT_BASE (use -f to overwrite)"
   fi
 
   TMP_CAND=$(mktemp "${TMPDIR:-/tmp}/snapper.cand.XXXXXX")
   TMP_METR=$(mktemp "${TMPDIR:-/tmp}/snapper.metr.XXXXXX")
-  trap 'rm -f "$TMP_CAND" "$TMP_METR"' EXIT HUP INT TERM
+  TMP_STRIPPED=$(mktemp "${TMPDIR:-/tmp}/snapper.stripped.XXXXXX")
+  TMP_NOBLANKS=$(mktemp "${TMPDIR:-/tmp}/snapper.noblanks.XXXXXX")
+  trap 'rm -f "$TMP_CAND" "$TMP_METR" "$TMP_STRIPPED" "$TMP_NOBLANKS"' EXIT HUP INT TERM
 
-  snap_list_candidates | sed 's#^\./##' | sort -u > "$TMP_CAND"
+  snap_list_candidates | sort > "$TMP_CAND"
 
   INCLUDED=0
   SKIP_SIZE=0
@@ -211,16 +363,16 @@ run_snap() {
   SKIP_NOMATCH=0
   SKIP_EXCLUDE=0
 
-  CURRENT_FILE_COUNT=0
   CURRENT_SNAPSHOT_INDEX=1
+  CURRENT_FILE_COUNT=0
 
   get_snapshot_filename() {
-    if [ "$CURRENT_SNAPSHOT_INDEX" -eq 1 ]; then
+    if [ "$SNAP_SPLIT_COUNT" -eq 0 ] || [ "$CURRENT_SNAPSHOT_INDEX" -eq 1 ]; then
       printf '%s' "$SNAP_OUTPUT_BASE"
     else
-      base_ext="${SNAP_OUTPUT_BASE##*.}"
       base_name="${SNAP_OUTPUT_BASE%.*}"
-      if [ "$base_ext" = "$base_name" ]; then # No extension
+      base_ext="${SNAP_OUTPUT_BASE##*.}"
+      if [ "$base_name" = "$SNAP_OUTPUT_BASE" ]; then
         printf '%s-%s' "$SNAP_OUTPUT_BASE" "$CURRENT_SNAPSHOT_INDEX"
       else
         printf '%s-%s.%s' "$base_name" "$CURRENT_SNAPSHOT_INDEX" "$base_ext"
@@ -293,10 +445,38 @@ EOF
         printf '%s\n' "$f" >> "$CURRENT_SNAPSHOT_FILE"
     else
         lang=$(snap_lang_fence "$f")
+
+        # Process file through the pipeline based on enabled flags
+        _source_file="$f"
+
+        # Step 1: Remove comments if requested
+        if [ "$SNAP_REMOVE_COMMENTS" -eq 1 ]; then
+          : > "$TMP_STRIPPED"
+
+          # Determine if we should strip # comments based on file extension
+          # Skip # removal for document formats where # has special meaning
+          _strip_hash=1
+          case "$ext" in
+            md|txt|rst|doc|docx|rtf|pdf|org|adoc|asciidoc)
+              _strip_hash=0
+              ;;
+          esac
+
+          strip_comments "$_source_file" "$TMP_STRIPPED" "$_strip_hash"
+          _source_file="$TMP_STRIPPED"
+        fi
+
+        # Step 2: Remove blank lines if requested
+        if [ "$SNAP_REMOVE_BLANKS" -eq 1 ]; then
+          : > "$TMP_NOBLANKS"
+          remove_blank_lines "$_source_file" "$TMP_NOBLANKS"
+          _source_file="$TMP_NOBLANKS"
+        fi
+
         {
           printf '%s\n' "$f"
           if [ -n "$lang" ]; then printf '%s%s\n' '```' "$lang"; else printf '%s\n' '```'; fi
-          cat -- "$f"
+          cat -- "$_source_file"
           printf '\n%s\n' '```'
           printf '\n'
         } >> "$CURRENT_SNAPSHOT_FILE"
@@ -314,6 +494,12 @@ EOF
     printf '%s\n' "files listed: $INCLUDED"
   else
     printf '%s\n' "files written: $INCLUDED"
+  fi
+  if [ "$SNAP_REMOVE_COMMENTS" -eq 1 ]; then
+    printf '%s\n' "comments: removed"
+  fi
+  if [ "$SNAP_REMOVE_BLANKS" -eq 1 ]; then
+    printf '%s\n' "blank lines: removed"
   fi
   if [ -s "$TMP_METR" ]; then
     printf '%s\n' "by extension:"

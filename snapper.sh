@@ -1,11 +1,11 @@
 #!/usr/bin/env sh
 # snapper.sh — take a text-only snapshot of repo files (paths + contents) and rebuild them later
 # mascot: 🐢 (a careful little turtle taking snapshots)
-# version: 0.0.9
+# version: 0.1.0
 
 set -eu
 
-VERSION="0.0.9"
+VERSION="0.1.0"
 
 # defaults for 'snap'
 SNAP_MAX_KB=200
@@ -13,18 +13,19 @@ SNAP_QUIET=0
 SNAP_USE_DEFAULT_IGNORES=1
 SNAP_FORCE_OVERWRITE=0
 SNAP_OUTPUT=""
-SNAP_PROJECT_ROOT="."   # configurable via -C
-SNAP_SPLIT_COUNT=0      # configurable via -s
-SNAP_TREE_ONLY=0        # configurable via -t
+SNAP_PROJECT_ROOT="."    # configurable via -C
+SNAP_SPLIT_COUNT=0       # configurable via -s
+SNAP_TREE_ONLY=0         # configurable via -t
 SNAP_EXCLUDE_PATTERNS="" # configurable via -e
-SNAP_REMOVE_COMMENTS=0  # configurable via -r
-SNAP_REMOVE_BLANKS=0    # configurable via -w
+SNAP_REMOVE_COMMENTS=0   # configurable via -r
+SNAP_REMOVE_BLANKS=0     # configurable via -w
+SNAP_PARALLEL_JOBS=4     # configurable via -j
 
 # defaults for 'build'
 BUILD_INPUT=""
-BUILD_TARGET_ROOT="."   # configurable via -C
-BUILD_FORCE=0           # overwrite existing files during build
-BUILD_MKDIR=0           # create build root if missing (-p)
+BUILD_TARGET_ROOT="." # configurable via -C
+BUILD_FORCE=0         # overwrite existing files during build
+BUILD_MKDIR=0         # create build root if missing (-p)
 
 emsg() { [ "${SNAP_QUIET:-0}" -eq 1 ] || { printf '%s\n' "$*" >&2; }; }
 die()  { printf '%s\n' "error: $*" >&2; exit 1; }
@@ -64,6 +65,7 @@ OPTIONS: snap
               .org, .adoc, and .asciidoc files to preserve document structure.
   -w          Remove all blank lines and trailing whitespace from files.
               Can be combined with -r for maximum token reduction.
+  -j <num>    Number of parallel jobs for processing files (default: 4, 0 = no parallelization).
   -e <pat>    Exclude pattern (can be used multiple times). Files matching any exclude
               pattern will be skipped even if they match an include pattern.
   -a          Include all dirs (disable default ignores like .git, node_modules, vendor, dist...).
@@ -86,6 +88,7 @@ BEHAVIOR:
   • Metrics print to stdout (not embedded in the snapshot).
   • Comment removal (-r) strips //, /* */, and # comments. Document formats (.md, .txt, etc.)
     are exempt from # removal to preserve structure (e.g., Markdown headers).
+  • Parallel processing (-j) processes multiple files concurrently for better performance.
 
 EXAMPLES:
   # Create a single, condensed snapshot of Go and Markdown files
@@ -96,6 +99,9 @@ EXAMPLES:
 
   # Remove comments and all blank lines for maximum compactness
   snapper.sh snap -r -w -o snapshot.txt '*.go' '*.js' '*.py'
+
+  # Use 8 parallel jobs for faster processing
+  snapper.sh snap -r -j 8 -o snapshot.txt '*.go' '*.js' '*.py'
 
   # Exclude test files when snapshotting Go files
   snapper.sh snap -o snapshot.txt -e '*_test.go' '*.go'
@@ -132,93 +138,71 @@ is_text_file() {
   fi
 }
 
-# strip comments from a file
-# handles: // line comments, /* */ block comments (including multi-line), and # line comments
-# _strip_hash parameter: 0=skip # removal (for .md, .txt, etc.), 1=remove # comments
+# Fast comment removal using awk (much faster than character-by-character processing)
 strip_comments() {
   _infile=$1
   _outfile=$2
   _strip_hash=$3
 
-  _in_block=0
-  _line_num=0
+  awk -v strip_hash="$_strip_hash" '
+  BEGIN {
+    in_block = 0
+  }
+  {
+    line = $0
+    output = ""
+    i = 1
+    len = length(line)
+    was_blank = (line ~ /^[[:space:]]*$/)
 
-  while IFS= read -r _line || [ -n "$_line" ]; do
-    _line_num=$((_line_num + 1))
-    _output=""
-    _i=1
-    _len=${#_line}
+    while (i <= len) {
+      char = substr(line, i, 1)
+      next_char = substr(line, i+1, 1)
 
-    # Check if original line is blank or whitespace-only
-    _original_trimmed=$(printf '%s' "$_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-    _originally_blank=0
-    if [ -z "$_original_trimmed" ]; then
-      _originally_blank=1
-    fi
-
-    # Process character by character
-    while [ $_i -le $_len ]; do
-      _char=$(printf '%s' "$_line" | cut -c $_i)
-      _next_char=""
-      if [ $_i -lt $_len ]; then
-        _next_char=$(printf '%s' "$_line" | cut -c $((_i + 1)))
-      fi
-
-      # If we're in a block comment, look for */
-      if [ $_in_block -eq 1 ]; then
-        if [ "$_char" = "*" ] && [ "$_next_char" = "/" ]; then
-          _in_block=0
-          _i=$((_i + 2))
+      # Handle block comments
+      if (in_block) {
+        if (char == "*" && next_char == "/") {
+          in_block = 0
+          i += 2
           continue
-        fi
-        _i=$((_i + 1))
+        }
+        i++
         continue
-      fi
+      }
 
-      # Check for start of block comment /*
-      if [ "$_char" = "/" ] && [ "$_next_char" = "*" ]; then
-        _in_block=1
-        _i=$((_i + 2))
+      # Check for block comment start
+      if (char == "/" && next_char == "*") {
+        in_block = 1
+        i += 2
         continue
-      fi
+      }
 
-      # Check for line comment //
-      if [ "$_char" = "/" ] && [ "$_next_char" = "/" ]; then
-        # Rest of line is a comment, break from character loop
+      # Check for line comment
+      if (char == "/" && next_char == "/") {
         break
-      fi
+      }
 
-      # Check for # line comment (if enabled for this file type)
-      if [ "$_strip_hash" -eq 1 ] && [ "$_char" = "#" ]; then
-        # Rest of line is a comment, break from character loop
+      # Check for # comment (if enabled)
+      if (strip_hash == 1 && char == "#") {
         break
-      fi
+      }
 
-      # Regular character, add to output
-      _output="${_output}${_char}"
-      _i=$((_i + 1))
-    done
+      output = output char
+      i++
+    }
 
-    # Decide whether to write the line:
-    # 1. If originally blank/whitespace-only, preserve it as blank
-    # 2. Otherwise, check if we extracted any code after comment removal
-    #    - If yes, write it (after trimming trailing whitespace)
-    #    - If no, skip the line (it was comment-only)
-
-    if [ $_originally_blank -eq 1 ]; then
-      # Original line was blank or whitespace-only, preserve it
-      printf '\n' >> "$_outfile"
-    else
-      # Original line had content, check what remains after comment removal
-      _trimmed=$(printf '%s' "$_output" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-      if [ -n "$_trimmed" ]; then
-        # Line has code, write it (with trailing whitespace removed)
-        _output=$(printf '%s' "$_output" | sed 's/[[:space:]]*$//')
-        printf '%s\n' "$_output" >> "$_outfile"
-      fi
-      # Otherwise skip the line (it was comment-only)
-    fi
-  done < "$_infile"
+    # Preserve originally blank lines, skip comment-only lines
+    if (was_blank) {
+      print ""
+    } else {
+      # Remove trailing whitespace
+      gsub(/[[:space:]]+$/, "", output)
+      if (length(output) > 0) {
+        print output
+      }
+    }
+  }
+  ' "$_infile" > "$_outfile"
 }
 
 # remove blank lines and trailing whitespace from a file
@@ -226,15 +210,12 @@ remove_blank_lines() {
   _infile=$1
   _outfile=$2
 
-  while IFS= read -r _line || [ -n "$_line" ]; do
+  awk '{
     # Remove trailing whitespace
-    _line=$(printf '%s' "$_line" | sed 's/[[:space:]]*$//')
-
-    # Only write non-empty lines
-    if [ -n "$_line" ]; then
-      printf '%s\n' "$_line" >> "$_outfile"
-    fi
-  done < "$_infile"
+    gsub(/[[:space:]]+$/, "")
+    # Only print non-empty lines
+    if (length($0) > 0) print
+  }' "$_infile" > "$_outfile"
 }
 
 ################################################################################
@@ -312,8 +293,64 @@ snap_lang_fence() {
   esac
 }
 
+# Process a single file (for parallel execution)
+# Process a single file (serial processing)
+process_file_serial() {
+  f=$1
+  tmpdir=$2
+
+  base=${f##*/}
+  ext=${base##*.}
+  if [ "$ext" = "$base" ] || [ -z "$ext" ]; then ext="(noext)"; fi
+  case "$ext" in *[A-Z]*) ext=$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]');; esac
+
+  printf '%s\n' "$ext" >> "$tmpdir/metrics.txt"
+
+  if [ "$SNAP_TREE_ONLY" -eq 1 ]; then
+    printf '%s\n' "$f" >> "$tmpdir/chunk_$(printf '%s' "$f" | cksum | cut -d' ' -f1).txt"
+  else
+    lang=$(snap_lang_fence "$f")
+
+    _source_file="$f"
+    _temp_file="$tmpdir/temp_$(printf '%s' "$f" | cksum | cut -d' ' -f1).txt"
+
+    # Step 1: Remove comments if requested
+    if [ "$SNAP_REMOVE_COMMENTS" -eq 1 ]; then
+      _strip_hash=1
+      case "$ext" in
+        md|txt|rst|doc|docx|rtf|pdf|org|adoc|asciidoc)
+          _strip_hash=0
+          ;;
+      esac
+
+      strip_comments "$_source_file" "$_temp_file" "$_strip_hash"
+      _source_file="$_temp_file"
+    fi
+
+    # Step 2: Remove blank lines if requested
+    if [ "$SNAP_REMOVE_BLANKS" -eq 1 ]; then
+      _temp_file2="${_temp_file}.2"
+      remove_blank_lines "$_source_file" "$_temp_file2"
+      rm -f "$_temp_file"
+      _source_file="$_temp_file2"
+      _temp_file="$_temp_file2"
+    fi
+
+    _chunk_file="$tmpdir/chunk_$(printf '%s' "$f" | cksum | cut -d' ' -f1).txt"
+    {
+      printf '%s\n' "$f"
+      if [ -n "$lang" ]; then printf '%s%s\n' '```' "$lang"; else printf '%s\n' '```'; fi
+      cat -- "$_source_file"
+      printf '\n%s\n' '```'
+      printf '\n'
+    } >> "$_chunk_file"
+
+    rm -f "$_temp_file"
+  fi
+}
+
 run_snap() {
-  while getopts "o:C:m:s:te:aqfrwh" opt; do
+  while getopts "o:C:m:s:te:aqfrwj:h" opt; do
     case "$opt" in
       o) SNAP_OUTPUT="$OPTARG" ;;
       C) SNAP_PROJECT_ROOT="$OPTARG" ;;
@@ -326,6 +363,7 @@ run_snap() {
       f) SNAP_FORCE_OVERWRITE=1 ;;
       r) SNAP_REMOVE_COMMENTS=1 ;;
       w) SNAP_REMOVE_BLANKS=1 ;;
+      j) SNAP_PARALLEL_JOBS="$OPTARG" ;;
       h) print_help; exit 0 ;;
       \?) die "unknown flag -$OPTARG (use -h)" ;;
       :)  die "flag -$OPTARG requires an argument" ;;
@@ -350,10 +388,9 @@ run_snap() {
   fi
 
   TMP_CAND=$(mktemp "${TMPDIR:-/tmp}/snapper.cand.XXXXXX")
-  TMP_METR=$(mktemp "${TMPDIR:-/tmp}/snapper.metr.XXXXXX")
-  TMP_STRIPPED=$(mktemp "${TMPDIR:-/tmp}/snapper.stripped.XXXXXX")
-  TMP_NOBLANKS=$(mktemp "${TMPDIR:-/tmp}/snapper.noblanks.XXXXXX")
-  trap 'rm -f "$TMP_CAND" "$TMP_METR" "$TMP_STRIPPED" "$TMP_NOBLANKS"' EXIT HUP INT TERM
+  TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/snapper.work.XXXXXX")
+  TMP_PROCESS=$(mktemp "${TMPDIR:-/tmp}/snapper.process.XXXXXX")
+  trap 'rm -rf "$TMP_CAND" "$TMP_DIR" "$TMP_PROCESS"' EXIT HUP INT TERM
 
   snap_list_candidates | sort > "$TMP_CAND"
 
@@ -363,26 +400,7 @@ run_snap() {
   SKIP_NOMATCH=0
   SKIP_EXCLUDE=0
 
-  CURRENT_SNAPSHOT_INDEX=1
-  CURRENT_FILE_COUNT=0
-
-  get_snapshot_filename() {
-    if [ "$SNAP_SPLIT_COUNT" -eq 0 ] || [ "$CURRENT_SNAPSHOT_INDEX" -eq 1 ]; then
-      printf '%s' "$SNAP_OUTPUT_BASE"
-    else
-      base_name="${SNAP_OUTPUT_BASE%.*}"
-      base_ext="${SNAP_OUTPUT_BASE##*.}"
-      if [ "$base_name" = "$SNAP_OUTPUT_BASE" ]; then
-        printf '%s-%s' "$SNAP_OUTPUT_BASE" "$CURRENT_SNAPSHOT_INDEX"
-      else
-        printf '%s-%s.%s' "$base_name" "$CURRENT_SNAPSHOT_INDEX" "$base_ext"
-      fi
-    fi
-  }
-
-  CURRENT_SNAPSHOT_FILE=$(get_snapshot_filename)
-  : > "$CURRENT_SNAPSHOT_FILE" || die "cannot write to $CURRENT_SNAPSHOT_FILE"
-
+  # Filter files and create process list
   while IFS= read -r f; do
     [ -f "$f" ] || continue
 
@@ -428,64 +446,191 @@ EOF
         fi
     fi
 
-    if [ "$SNAP_SPLIT_COUNT" -gt 0 ] && [ "$CURRENT_FILE_COUNT" -ge "$SNAP_SPLIT_COUNT" ]; then
-        CURRENT_FILE_COUNT=0
-        CURRENT_SNAPSHOT_INDEX=$((CURRENT_SNAPSHOT_INDEX + 1))
-        CURRENT_SNAPSHOT_FILE=$(get_snapshot_filename)
-        : > "$CURRENT_SNAPSHOT_FILE" || die "cannot write to $CURRENT_SNAPSHOT_FILE"
-    fi
-
-    base=${f##*/}
-    ext=${base##*.}
-    if [ "$ext" = "$base" ] || [ -z "$ext" ]; then ext="(noext)"; fi
-    case "$ext" in *[A-Z]*) ext=$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]');; esac
-    printf '%s\n' "$ext" >> "$TMP_METR"
-
-    if [ "$SNAP_TREE_ONLY" -eq 1 ]; then
-        printf '%s\n' "$f" >> "$CURRENT_SNAPSHOT_FILE"
-    else
-        lang=$(snap_lang_fence "$f")
-
-        # Process file through the pipeline based on enabled flags
-        _source_file="$f"
-
-        # Step 1: Remove comments if requested
-        if [ "$SNAP_REMOVE_COMMENTS" -eq 1 ]; then
-          : > "$TMP_STRIPPED"
-
-          # Determine if we should strip # comments based on file extension
-          # Skip # removal for document formats where # has special meaning
-          _strip_hash=1
-          case "$ext" in
-            md|txt|rst|doc|docx|rtf|pdf|org|adoc|asciidoc)
-              _strip_hash=0
-              ;;
-          esac
-
-          strip_comments "$_source_file" "$TMP_STRIPPED" "$_strip_hash"
-          _source_file="$TMP_STRIPPED"
-        fi
-
-        # Step 2: Remove blank lines if requested
-        if [ "$SNAP_REMOVE_BLANKS" -eq 1 ]; then
-          : > "$TMP_NOBLANKS"
-          remove_blank_lines "$_source_file" "$TMP_NOBLANKS"
-          _source_file="$TMP_NOBLANKS"
-        fi
-
-        {
-          printf '%s\n' "$f"
-          if [ -n "$lang" ]; then printf '%s%s\n' '```' "$lang"; else printf '%s\n' '```'; fi
-          cat -- "$_source_file"
-          printf '\n%s\n' '```'
-          printf '\n'
-        } >> "$CURRENT_SNAPSHOT_FILE"
-    fi
-
+    printf '%s\n' "$f" >> "$TMP_PROCESS"
     INCLUDED=$((INCLUDED+1))
-    CURRENT_FILE_COUNT=$((CURRENT_FILE_COUNT + 1))
   done < "$TMP_CAND"
 
+  # Export variables for subshells
+  export SNAP_TREE_ONLY SNAP_REMOVE_COMMENTS SNAP_REMOVE_BLANKS SNAP_QUIET
+
+  # Process files (parallel or serial)
+  if [ "$SNAP_PARALLEL_JOBS" -gt 0 ] && [ "$INCLUDED" -gt 0 ] && command -v xargs >/dev/null 2>&1; then
+    # Check if xargs supports -P (parallel processing)
+    if xargs -P 1 echo test </dev/null >/dev/null 2>&1; then
+      # Use parallel processing with xargs
+      cat "$TMP_PROCESS" | xargs -P "$SNAP_PARALLEL_JOBS" -I '{}' sh -c '
+        f="{}"
+        tmpdir="'"$TMP_DIR"'"
+
+        base="${f##*/}"
+        ext="${base##*.}"
+        if [ "$ext" = "$base" ] || [ -z "$ext" ]; then ext="(noext)"; fi
+        case "$ext" in *[A-Z]*) ext=$(printf "%s" "$ext" | tr "[:upper:]" "[:lower:]");; esac
+
+        printf "%s\n" "$ext" >> "$tmpdir/metrics.txt"
+
+        if [ "$SNAP_TREE_ONLY" -eq 1 ]; then
+          _chunk="$tmpdir/chunk_$(printf "%s" "$f" | cksum | cut -d" " -f1).txt"
+          printf "%s\n" "$f" >> "$_chunk"
+        else
+          # Determine language for fence
+          _ext="${f##*.}"
+          case "$_ext" in
+            go) lang="go" ;;
+            js) lang="javascript" ;;
+            ts) lang="typescript" ;;
+            json) lang="json" ;;
+            yml|yaml) lang="yaml" ;;
+            md) lang="markdown" ;;
+            sh|zsh|bash) lang="bash" ;;
+            py) lang="python" ;;
+            rb) lang="ruby" ;;
+            rs) lang="rust" ;;
+            c|h) lang="c" ;;
+            cpp|cc|cxx|hpp) lang="cpp" ;;
+            java) lang="java" ;;
+            *) lang="" ;;
+          esac
+
+          _source_file="$f"
+          _temp_file="$tmpdir/temp_$(printf "%s" "$f" | cksum | cut -d" " -f1).txt"
+
+          # Step 1: Remove comments if requested
+          if [ "$SNAP_REMOVE_COMMENTS" -eq 1 ]; then
+            _strip_hash=1
+            case "$ext" in
+              md|txt|rst|doc|docx|rtf|pdf|org|adoc|asciidoc) _strip_hash=0 ;;
+            esac
+
+            awk -v strip_hash="$_strip_hash" '"'"'
+            BEGIN { in_block = 0 }
+            {
+              line = $0
+              output = ""
+              i = 1
+              len = length(line)
+              was_blank = (line ~ /^[[:space:]]*$/)
+
+              while (i <= len) {
+                char = substr(line, i, 1)
+                next_char = substr(line, i+1, 1)
+
+                if (in_block) {
+                  if (char == "*" && next_char == "/") {
+                    in_block = 0
+                    i += 2
+                    continue
+                  }
+                  i++
+                  continue
+                }
+
+                if (char == "/" && next_char == "*") {
+                  in_block = 1
+                  i += 2
+                  continue
+                }
+
+                if (char == "/" && next_char == "/") break
+                if (strip_hash == 1 && char == "#") break
+
+                output = output char
+                i++
+              }
+
+              if (was_blank) {
+                print ""
+              } else {
+                gsub(/[[:space:]]+$/, "", output)
+                if (length(output) > 0) print output
+              }
+            }
+            '"'"' "$_source_file" > "$_temp_file"
+            _source_file="$_temp_file"
+          fi
+
+          # Step 2: Remove blank lines if requested
+          if [ "$SNAP_REMOVE_BLANKS" -eq 1 ]; then
+            _temp_file2="${_temp_file}.2"
+            awk '"'"'{
+              gsub(/[[:space:]]+$/, "")
+              if (length($0) > 0) print
+            }'"'"' "$_source_file" > "$_temp_file2"
+            rm -f "$_temp_file"
+            _source_file="$_temp_file2"
+            _temp_file="$_temp_file2"
+          fi
+
+          # Write to chunk file
+          _chunk="$tmpdir/chunk_$(printf "%s" "$f" | cksum | cut -d" " -f1).txt"
+          {
+            printf "%s\n" "$f"
+            if [ -n "$lang" ]; then
+              printf "%.0s\`" 1 2 3
+              printf "%s\n" "$lang"
+            else
+              printf "%.0s\`" 1 2 3
+              printf "\n"
+            fi
+            cat "$_source_file"
+            printf "\n"
+            printf "%.0s\`" 1 2 3
+            printf "\n\n"
+          } >> "$_chunk"
+
+          rm -f "$_temp_file"
+        fi
+      '
+    else
+      # xargs doesn't support -P, use serial processing
+      while IFS= read -r f; do
+        process_file_serial "$f" "$TMP_DIR"
+      done < "$TMP_PROCESS"
+    fi
+  else
+    # Serial processing
+    while IFS= read -r f; do
+      process_file_serial "$f" "$TMP_DIR"
+    done < "$TMP_PROCESS"
+  fi
+
+  # Combine all chunks into output file
+  : > "$SNAP_OUTPUT_BASE" || die "cannot write to $SNAP_OUTPUT_BASE"
+
+  if [ "$SNAP_SPLIT_COUNT" -gt 0 ]; then
+    # Handle split output
+    file_count=0
+    current_index=1
+    current_file="$SNAP_OUTPUT_BASE"
+
+    for chunk in "$TMP_DIR"/chunk_*.txt; do
+      [ -f "$chunk" ] || continue
+
+      if [ "$file_count" -ge "$SNAP_SPLIT_COUNT" ]; then
+        file_count=0
+        current_index=$((current_index + 1))
+        base_name="${SNAP_OUTPUT_BASE%.*}"
+        base_ext="${SNAP_OUTPUT_BASE##*.}"
+        if [ "$base_name" = "$SNAP_OUTPUT_BASE" ]; then
+          current_file="${SNAP_OUTPUT_BASE}-${current_index}"
+        else
+          current_file="${base_name}-${current_index}.${base_ext}"
+        fi
+        : > "$current_file"
+      fi
+
+      cat "$chunk" >> "$current_file"
+      file_count=$((file_count + 1))
+    done
+  else
+    # Single output file
+    for chunk in "$TMP_DIR"/chunk_*.txt; do
+      [ -f "$chunk" ] || continue
+      cat "$chunk" >> "$SNAP_OUTPUT_BASE"
+    done
+  fi
+
+  # Print metrics
   printf '%s\n' "== snapper snap metrics =="
   printf '%s\n' "version: $VERSION"
   printf '%s\n' "project_root: $SNAP_PROJECT_ROOT_ABS"
@@ -501,9 +646,13 @@ EOF
   if [ "$SNAP_REMOVE_BLANKS" -eq 1 ]; then
     printf '%s\n' "blank lines: removed"
   fi
-  if [ -s "$TMP_METR" ]; then
+  if [ "$SNAP_PARALLEL_JOBS" -gt 0 ]; then
+    printf '%s\n' "parallel jobs: $SNAP_PARALLEL_JOBS"
+  fi
+
+  if [ -f "$TMP_DIR/metrics.txt" ]; then
     printf '%s\n' "by extension:"
-    awk '{c[$0]++} END {for (k in c) printf "%s %d\n", k, c[k]}' "$TMP_METR" \
+    awk '{c[$0]++} END {for (k in c) printf "%s %d\n", k, c[k]}' "$TMP_DIR/metrics.txt" \
       | sort -k2,2nr -k1,1 \
       | while IFS=' ' read -r k v; do
           case "$k" in

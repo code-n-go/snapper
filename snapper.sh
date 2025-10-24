@@ -1,11 +1,11 @@
 #!/usr/bin/env sh
 # snapper.sh — take a text-only snapshot of repo files (paths + contents) and rebuild them later
 # mascot: 🐢 (a careful little turtle taking snapshots)
-# version: 0.1.0
+# version: 0.1.1
 
 set -eu
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 
 # defaults for 'snap'
 SNAP_MAX_KB=200
@@ -357,7 +357,8 @@ run_snap() {
       m) SNAP_MAX_KB="$OPTARG" ;;
       s) SNAP_SPLIT_COUNT="$OPTARG" ;;
       t) SNAP_TREE_ONLY=1 ;;
-      e) SNAP_EXCLUDE_PATTERNS="${SNAP_EXCLUDE_PATTERNS}${OPTARG}"$'\n' ;;
+      e) SNAP_EXCLUDE_PATTERNS="${SNAP_EXCLUDE_PATTERNS}${OPTARG}
+" ;;
       a) SNAP_USE_DEFAULT_IGNORES=0 ;;
       q) SNAP_QUIET=1 ;;
       f) SNAP_FORCE_OVERWRITE=1 ;;

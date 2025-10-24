@@ -1,7 +1,7 @@
 # snapper.sh — text-only project snapshots for LLM prompts (and rebuilds)
 
 > **mascot:** 🐢 a careful little turtle taking snapshots  
-> **version:** 0.1.0  
+> **version:** 0.1.1  
 > **type:** portable POSIX `sh` script
 
 `snapper.sh` lets you:
@@ -276,7 +276,7 @@ snapper snap -o snapshot.txt -e 'vendor/**' -e '**/generated/**' -e '*.gen.go' '
 
 ```text
 == snapper snap metrics ==
-version: 0.1.0
+version: 0.1.1
 project_root: /home/you/myproj
 output: /home/you/myproj/snapshot.txt (and subsequent numbered files if split)
 files written: 42
@@ -400,6 +400,7 @@ during `build`, snapper looks for simple blocks of a path on one line followed b
 
 ## changelog
 
+* **0.1.1** — **BUGFIX**: fix `-e` (exclude patterns) flag to work correctly. the script was using bashism `$'\n'` which isn't POSIX sh compatible, causing exclude patterns to be treated as literal strings instead of proper patterns. now uses POSIX-compatible newline handling.
 * **0.1.0** — **MAJOR RELEASE**: `snap`: massive performance improvements! replace character-by-character comment removal with fast `awk` processing (**10-100x faster**). add `-j` flag for parallel file processing (default 4 jobs) to further speed up large projects (**additional 3-8x speedup**). add `-w` flag to remove all blank lines and trailing whitespace for maximum token reduction. fix `-r` to properly preserve original blank lines while removing comment-only lines. combined, these changes make snapper **20-75x faster** on typical projects!
 * **0.0.8** — `snap`: add `#` line comment removal support (shell/Python-style). automatically exempt document formats (.md, .txt, .rst, .doc, .docx, .rtf, .pdf, .org, .adoc, .asciidoc) from `#` removal to preserve structure like markdown headers. **important clarification**: the `-r` flag only affects snapshot content, never modifies original source files.
 * **0.0.7** — `snap`: add `-r` flag to remove C-style comments (`//` and `/* */`) from files before snapshotting, reducing token usage for LLM context.
